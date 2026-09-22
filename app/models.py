@@ -180,6 +180,79 @@ class CheckinRequest(BaseModel):
     participant_id: str = Field(..., min_length=1, description="参与者标识")
 
 
+class BatchCheckinRequest(BaseModel):
+    participants: list[str] = Field(
+        ...,
+        min_length=1,
+        description="批量报到的参与者标识列表（如主机名、任务 id）；自动去除首尾空白，不得含空标识或重复标识",
+    )
+    idempotency_key: str = Field(
+        ...,
+        min_length=1,
+        max_length=256,
+        description=(
+            "客户端生成的幂等键（1-256 字符）；同一幂等键的重试返回首次结果，"
+            "与不同参与者列表复用同一幂等键返回 409"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "BatchCheckinRequest":
+        # 与创建名单一致地清洗：去首尾空白、拒绝空标识、拒绝批内重复。
+        cleaned: list[str] = []
+        for p in self.participants:
+            name = p.strip()
+            if not name:
+                raise ValueError("participants 不得包含空字符串")
+            if name in cleaned:
+                raise ValueError(f"参与者 {name!r} 在同一次批量报到中重复")
+            cleaned.append(name)
+        if not cleaned:
+            raise ValueError("participants 至少需要一个成员")
+        self.participants = cleaned
+
+        key = self.idempotency_key.strip()
+        if not key:
+            raise ValueError("idempotency_key 不得为空白字符串")
+        if len(key) > 256:
+            raise ValueError("idempotency_key 长度不得超过 256 字符")
+        self.idempotency_key = key
+        return self
+
+
+class BatchParticipantResult(BaseModel):
+    participant_id: str = Field(description="参与者标识")
+    result: str = Field(
+        description=(
+            "该成员在本次（首次执行的）批量操作中的结果："
+            "checked_in（新报到）| already_checked_in（此前已报到）"
+            "| reached（本批中触发达标的成员，至多一个）| late（达标后报到）"
+        )
+    )
+
+
+class BatchCheckinResponse(BaseModel):
+    barrier_id: str
+    status: str = Field(
+        description=(
+            "checked_in（本批已受理，屏障继续等待）| reached（本批使屏障达标）"
+            "| late（屏障已达标，本批全部记为迟到）"
+        )
+    )
+    triggered: bool = Field(description="本批是否首次使屏障达标并冻结 quorum；重试回放恒为首次值")
+    replayed: bool = Field(
+        description="true 表示本次响应由同一幂等键的首次结果回放，未再次执行报到"
+    )
+    idempotency_key: str = Field(description="请求携带的幂等键（去首尾空白后）")
+    accepted_count: int = Field(description="本批参与者条数（等于 accepted 长度）")
+    accepted: list[BatchParticipantResult] = Field(
+        description="逐成员结果，顺序与首次请求的 participants 一致；重试回放首次列表"
+    )
+    quorum: list[str] | None = None
+    frozen_at: datetime | None = None
+    view: BarrierView
+
+
 class CheckinResponse(BaseModel):
     barrier_id: str
     status: str = Field(

@@ -17,23 +17,24 @@ def _dt(ts: float) -> datetime:
 
 
 def _group_progress(
-    meta: BarrierMeta, counts: dict[str, int]
+    thresholds: dict[str, int], counts: dict[str, int]
 ) -> list[GroupProgress] | None:
-    """组装分组配额进度；未启用分组配额时返回 None（保持旧版响应形态）。
+    """组装分组配额进度；未启用分组配额（无配额表）时返回 None。
 
-    reached 状态传入的 counts 是冻结快照，其余状态是实时计数；
-    satisfied 统一按 counts 与配额比较，终态视图因此不再回读可变数据。
+    reached 状态传入的 counts 是冻结快照，其余状态是实时计数或批量首次
+    执行后的快照；satisfied 统一按 counts 与配额比较，终态视图因此不再
+    回读可变数据。
     """
-    if not meta.groups_enabled:
+    if not thresholds:
         return None
     return [
         GroupProgress(
             group=group,
-            threshold=meta.group_thresholds[group],
+            threshold=thresholds[group],
             checked_count=int(counts.get(group, 0)),
-            satisfied=int(counts.get(group, 0)) >= meta.group_thresholds[group],
+            satisfied=int(counts.get(group, 0)) >= thresholds[group],
         )
-        for group in sorted(meta.group_thresholds)
+        for group in sorted(thresholds)
     ]
 
 
@@ -78,7 +79,7 @@ async def build_view(store: BarrierStore, meta: BarrierMeta, now: float | None =
             late=late or None,
             creator_id=meta.creator_id,
             participant_groups=groups,
-            group_progress=_group_progress(meta, group_counts),
+            group_progress=_group_progress(meta.group_thresholds, group_counts),
         )
 
     if cancelled is not None:
@@ -97,7 +98,7 @@ async def build_view(store: BarrierStore, meta: BarrierMeta, now: float | None =
             cancelled_at=_dt(cancelled["cancelled_at"]),
             creator_id=meta.creator_id,
             participant_groups=groups,
-            group_progress=_group_progress(meta, group_counts),
+            group_progress=_group_progress(meta.group_thresholds, group_counts),
         )
 
     if now >= meta.deadline:
@@ -116,7 +117,7 @@ async def build_view(store: BarrierStore, meta: BarrierMeta, now: float | None =
             missing=missing,
             creator_id=meta.creator_id,
             participant_groups=groups,
-            group_progress=_group_progress(meta, group_counts),
+            group_progress=_group_progress(meta.group_thresholds, group_counts),
         )
 
     checked_sorted = sorted(checked)
@@ -131,7 +132,51 @@ async def build_view(store: BarrierStore, meta: BarrierMeta, now: float | None =
         checked_count=len(checked_sorted),
         creator_id=meta.creator_id,
         participant_groups=groups,
-        group_progress=_group_progress(meta, group_counts),
+        group_progress=_group_progress(meta.group_thresholds, group_counts),
+    )
+
+
+def build_view_from_snapshot(barrier_id: str, snap: dict) -> BarrierView:
+    """从批量报到首次执行时冻结的快照重建完整 BarrierView。
+
+    同一幂等键重试必须返回**首次结果**：因此回放视图不能回读任何可变状态
+    （首次执行后可能又有其他报到 / 截止到达），而由 Lua 脚本在首次执行的
+    同一原子操作内保存的快照逐字段还原。快照内名单与报到集合已排序。
+    """
+    quotas = snap.get("quotas") or {}
+    groups = snap.get("gmap") if quotas else None
+    group_counts = {g: int(n) for g, n in (snap.get("gcounts") or {}).items()}
+    common = dict(
+        barrier_id=barrier_id,
+        participants=list(snap["participants"]),
+        threshold=int(snap["threshold"]),
+        deadline=_dt(float(snap["deadline"])),
+        created_at=_dt(float(snap["created_at"])),
+        checked_in=list(snap["checked_in"]),
+        creator_id=snap.get("creator") or None,
+        participant_groups=groups,
+        group_progress=_group_progress(quotas, group_counts),
+    )
+
+    if snap["view_status"] == "reached":
+        quorum = list(snap["quorum"])
+        late = snap.get("late") or None
+        return BarrierView(
+            **common,
+            status="reached",
+            # reached 视图的报到人数取冻结人数，而非迟到后的集合大小。
+            checked_count=len(quorum),
+            quorum=quorum,
+            frozen_at=_dt(float(snap["frozen_at"])),
+            late=late,
+        )
+
+    # 批量脚本的成功路径只可能留下 waiting / reached 两种视图状态：
+    # expired / cancelled 在写入前整批拒绝，不保存快照。
+    return BarrierView(
+        **common,
+        status=snap["view_status"],
+        checked_count=len(snap["checked_in"]),
     )
 
 

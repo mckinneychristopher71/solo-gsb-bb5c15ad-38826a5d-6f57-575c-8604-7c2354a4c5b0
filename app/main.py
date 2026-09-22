@@ -4,6 +4,7 @@
   POST   /barriers                          创建屏障（参与者名单、达标人数、截止时间）
   GET    /barriers/{bid}                    查询当前状态（不阻塞）
   POST   /barriers/{bid}/checkin            参与者幂等报到
+  POST   /barriers/{bid}/batch-checkins     参与者批量幂等报到（幂等键 + 首次结果回放）
   POST   /barriers/{bid}/cancel             主动取消（与达标报到原子竞争，先发生者为唯一终态）
   PATCH  /barriers/{bid}/deadline           运行中延期（仅 waiting 且新时间更晚时原子生效）
   POST   /barriers/{bid}/replace            运行中替补（未报到成员原子换为名单外新标识并继承分组）
@@ -32,6 +33,8 @@ from .barrier_store import (
     BarrierReached,
     BarrierStore,
     BarrierSubstituteConflict,
+    BatchNotParticipant,
+    IdempotencyConflict,
     NotAParticipant,
     ParticipantNotInRoster,
     ReplacementInRoster,
@@ -40,6 +43,9 @@ from .config import load_settings
 from .models import (
     BarrierEventsPage,
     BarrierView,
+    BatchCheckinRequest,
+    BatchCheckinResponse,
+    BatchParticipantResult,
     CancelRequest,
     CancelResponse,
     CheckinEvent,
@@ -50,7 +56,7 @@ from .models import (
     ReplaceRequest,
     ReplaceResponse,
 )
-from .service import _dt, build_view, wait_for_settle
+from .service import _dt, build_view, build_view_from_snapshot, wait_for_settle
 
 settings = load_settings()
 
@@ -66,10 +72,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="任务收尾屏障 API",
     description=(
-        "并行任务协调收尾：创建屏障、幂等报到、阻塞等待达标、取消或截止、"
-        "运行中延期与运行中参与者替补。"
+        "并行任务协调收尾：创建屏障、幂等报到、批量幂等报到、阻塞等待达标、"
+        "取消或截止、运行中延期与运行中参与者替补。"
     ),
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -95,6 +101,7 @@ async def root() -> dict[str, object]:
             "create": "POST /barriers",
             "get": "GET /barriers/{barrier_id}",
             "checkin": "POST /barriers/{barrier_id}/checkin",
+            "batch_checkin": "POST /barriers/{barrier_id}/batch-checkins",
             "cancel": "POST /barriers/{barrier_id}/cancel",
             "extend": "PATCH /barriers/{barrier_id}/deadline",
             "replace": "POST /barriers/{barrier_id}/replace",
@@ -197,6 +204,83 @@ async def checkin(
         barrier_id=barrier_id,
         status=result.status,
         triggered=result.triggered,
+        quorum=result.quorum,
+        frozen_at=_dt(result.frozen_at) if result.frozen_at is not None else None,
+        view=view,
+    )
+
+
+@app.post(
+    "/barriers/{barrier_id}/batch-checkins",
+    response_model=BatchCheckinResponse,
+    tags=["barriers"],
+)
+async def batch_checkin(
+    barrier_id: str, payload: BatchCheckinRequest, request: Request
+) -> BatchCheckinResponse:
+    """参与者批量幂等报到（名单校验、截止/取消校验、整批写入均在同一段 Redis
+    Lua 脚本内一次原子完成）。
+
+    - **幂等**：同一 ``idempotency_key`` 的重试不再次执行报到，逐字段回放
+      **首次响应**（含首次执行时刻的 ``view`` 快照、``triggered`` /
+      ``quorum`` / ``frozen_at`` 与逐成员结果，``replayed=true``）；同键但
+      参与者集合不同返回 ``409``；
+    - **整批原子**：参与者列表中任一成员不在（替补后的）名单内、或屏障已过
+      截止时间、或已被取消时，**整批不产生任何报到副作用**——不写报到集合、
+      不推进分组计数、不追加审计事件，也不占用幂等键，随后可用同一幂等键
+      携带修正后的名单安全重试；
+    - **达标冻结**：本批首次同时满足「总达标人数 + 各组配额」时，quorum 与
+      分组计数在 Lua 脚本内被原子冻结；批量接口与单人报到接口共用同一冻结
+      键，跨接口并发也**只有一个请求** ``triggered=true``，冻结成功后发布
+      Pub/Sub 唤醒全部 /wait 等待者；
+    - 已达标冻结后的批量报到全部记为迟到（``status=late``），快照永不改写；
+      已取消后批量报到返回 ``409``。
+    """
+    await _load_meta(request, barrier_id)
+    svc = store(request)
+    try:
+        result, replayed = await svc.batch_checkin(
+            barrier_id,
+            participants=payload.participants,
+            idempotency_key=payload.idempotency_key,
+        )
+    except BatchNotParticipant as exc:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"参与者 {exc.args[0]!r} 不在该屏障名单内，整批报到被拒绝"
+                "（未产生任何报到）"
+            ),
+        )
+    except BarrierExpired:
+        raise HTTPException(status_code=409, detail="屏障已过截止时间，整批报到被拒绝")
+    except BarrierCancelled:
+        raise HTTPException(status_code=409, detail="屏障已被取消，整批报到被拒绝")
+    except IdempotencyConflict:
+        raise HTTPException(
+            status_code=409,
+            detail="该幂等键已用于另一份参与者列表，不能改写首次结果",
+        )
+    except BarrierNotFound:
+        raise HTTPException(status_code=404, detail="屏障不存在或已过期回收")
+
+    # 重试回放使用首次执行时冻结的视图快照：即使之后又有报到 / 取消 / 截止，
+    # 同幂等键也必须返回首次响应。首次执行则快照 == 执行后的实时状态。
+    view = build_view_from_snapshot(barrier_id, result.snapshot)
+
+    return BatchCheckinResponse(
+        barrier_id=barrier_id,
+        status=result.status,
+        triggered=result.triggered,
+        replayed=replayed,
+        idempotency_key=result.idempotency_key,
+        accepted_count=len(result.accepted),
+        accepted=[
+            BatchParticipantResult(
+                participant_id=item.participant_id, result=item.result
+            )
+            for item in result.accepted
+        ],
         quorum=result.quorum,
         frozen_at=_dt(result.frozen_at) if result.frozen_at is not None else None,
         view=view,
@@ -398,12 +482,14 @@ async def list_events(
 ) -> BarrierEventsPage:
     """查询审计事件（按 seq 升序，cursor/limit 分页）。
 
-    每次名单成员报到（首次、重复、达标、迟到）都会在与状态变更同一 Redis
-    原子操作中追加一条事件；运行中参与者替补成功时也在换人脚本内追加一条
-    ``replaced`` 事件（``participant_id`` 为换上的新标识，
-    ``original_participant_id`` 为被换下的原成员）。非名单成员、截止后报到、
-    被拒绝的替补等错误请求不产生事件。事件只增不改，游标分页在并发写入下
-    稳定不重不漏；屏障回收后事件一并消失。
+    每次名单成员报到（首次、重复、达标、迟到；含批量报到中的逐成员结果，
+    每批至多一条 reached）都会在与状态变更同一 Redis 原子操作中追加一条
+    事件；运行中参与者替补成功时也在换人脚本内追加一条 ``replaced`` 事件
+    （``participant_id`` 为换上的新标识，``original_participant_id`` 为被
+    换下的原成员）。非名单成员、截止后报到、被整批拒绝的批量报到、被拒绝
+    的替补等错误请求不产生事件；批量报到的幂等重试只回放首次结果，不重复
+    追加事件。事件只增不改，游标分页在并发写入下稳定不重不漏；屏障回收后
+    事件一并消失。
     """
     await _load_meta(request, barrier_id)
     events, next_cursor = await store(request).list_events(barrier_id, cursor, limit)

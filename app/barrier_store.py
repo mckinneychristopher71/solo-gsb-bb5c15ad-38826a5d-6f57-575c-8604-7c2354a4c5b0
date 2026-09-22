@@ -12,12 +12,19 @@
                             含报到事件与运行中替补事件）
 ``barrier:{bid}:gmap``      hash  参与者 -> 分组名（仅启用分组配额时存在）
 ``barrier:{bid}:gcheck``    hash  各分组去重后的报到人数（仅启用分组配额时存在）
+``barrier:{bid}:idem:idx``  set   本屏障已产生的批量报到幂等记录键集合，
+                            随屏障一起 TTL；延期脚本据此一并顺延幂等记录存活期
+``barrier:{bid}:idem:{h}``  hash  批量报到幂等记录（h = idempotency_key 的
+                            sha256 hex）：保存首次执行的完整结果快照（status/
+                            triggered/accepted/quorum/frozen_at/view snapshot），
+                            同一幂等键重试只回放首次结果，不再产生任何副作用
 
 ``frozen`` 与 ``cancel`` 互斥：达标报到与主动取消由各自的 Lua 脚本原子竞争，
 Redis 单线程串行执行脚本，先发生者成为唯一终态，任何路径都不得改写。
 运行中延期（deadline 延长）与运行中替补（未报到成员换人）由另外两段 Lua
 脚本与前两者同样地原子竞争：终态键（frozen/cancel）或已过截止的屏障一律
-拒绝延期与替补，绝不复活终态。
+拒绝延期与替补，绝不复活终态。批量报到由第五段 Lua 脚本在同一原子操作内
+完成全员名单校验、截止/取消校验、整批报到、达标冻结与幂等记录落盘。
 
 频道 ``barrier:{bid}:events`` 在达标冻结后发布 ``reached`` 消息、
 在主动取消后发布 ``cancelled`` 消息、在成功延期后发布 ``deadline_extended``
@@ -27,6 +34,7 @@ Redis 单线程串行执行脚本，先发生者成为唯一终态，任何路�
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import uuid
@@ -256,6 +264,7 @@ local events_key  = KEYS[5]
 local cancel_key  = KEYS[6]
 local gmap_key    = KEYS[7]
 local gcheck_key  = KEYS[8]
+local idemidx_key = KEYS[9]
 local new_deadline = tonumber(ARGV[1])
 local now          = tonumber(ARGV[2])
 local buffer_ms    = tonumber(ARGV[3])
@@ -300,6 +309,16 @@ redis.call('PEXPIRE', events_key, ttl_ms)
 redis.call('PEXPIRE', cancel_key, ttl_ms)
 redis.call('PEXPIRE', gmap_key, ttl_ms)
 redis.call('PEXPIRE', gcheck_key, ttl_ms)
+
+-- 批量报到幂等记录（若有）随延期一并顺延：KEYS[9] 缺省时（旧的 8-key
+-- 调用 / 直接 EVAL 兼容路径）跳过，不影响其它键的原子刷新。
+if idemidx_key then
+    redis.call('PEXPIRE', idemidx_key, ttl_ms)
+    local others = redis.call('SMEMBERS', idemidx_key)
+    for _, other in ipairs(others) do
+        redis.call('PEXPIRE', other, ttl_ms)
+    end
+end
 
 return {'extended', tostring(deadline), tostring(new_deadline), tostring(ttl_ms)}
 """
@@ -414,6 +433,306 @@ return {'replaced', original, replacement, tostring(group or ''), tostring(now)}
 """
 
 
+# 批量报到脚本。一次原子完成：
+#   1) 屏障存在性校验；
+#   2) 幂等记录查询：同一 idempotency_key 已执行过 -> 回放首次结果（replay=1）；
+#      同键但参与者集合不同 -> conflict，不触碰任何报到数据；
+#   3) 全员名单校验：任一成员不在（替补后的）名单内 -> not_participant，
+#      整批不产生任何报到副作用（不写 checked/gcheck/events/幂等记录）；
+#   4) 终态校验：已达标冻结 -> 整批按迟到处理（不改变冻结快照）；
+#      已取消 -> cancelled；已过截止 -> expired（后两者整批零副作用）；
+#   5) 整批 SADD checked（仅新成员 HINCRBY 分组计数），随后判定总数 + 分组配额，
+#      若本批使屏障达标则在同一脚本内冻结 quorum 与分组计数（与单人报到脚本
+#      互斥共用 frozen 键：跨接口并发也只有唯一一次冻结）；
+#   6) 逐成员审计事件（checked_in / already_checked_in / reached / late，
+#      每批至多一条 reached）与首次结果快照（幂等记录）在同一脚本内落盘。
+#
+# 返回数组：
+#   {'unknown'}
+#       屏障不存在
+#   {'conflict', 'idempotency_key'}
+#       幂等键已用于另一份参与者集合
+#   {'not_participant', pid}
+#       第一个名单外成员；整批零副作用
+#   {'expired'} / {'cancelled'}
+#       整批被拒绝，零副作用
+#   {'replay', record_json}
+#       同幂等键重试；record_json 为首次保存的完整结果（含 view 快照）
+#   {'ok', record_json}
+#       首次执行完成；record_json 与 replay 回放的内容逐字节同构
+#
+# record_json 结构：
+#   {status, triggered, accepted:[{participant_id,result}...], quorum,
+#    frozen_at, idempotency_key, snapshot:{...首次执行后可重建完整视图的字段}}
+BATCH_CHECKIN_SCRIPT = """
+local meta_key     = KEYS[1]
+local roster_key   = KEYS[2]
+local checked_key  = KEYS[3]
+local frozen_key   = KEYS[4]
+local events_key   = KEYS[5]
+local cancel_key   = KEYS[6]
+local gmap_key     = KEYS[7]
+local gcheck_key   = KEYS[8]
+local idem_key     = KEYS[9]
+local idemidx_key  = KEYS[10]
+local pids_json    = ARGV[1]
+local now          = tonumber(ARGV[2])
+local idem_key_arg = ARGV[3]
+local fp           = ARGV[4]
+
+local function refresh_ttl()
+    local ttl_ms = tonumber(redis.call('HGET', meta_key, 'ttl_ms'))
+    if ttl_ms then
+        redis.call('PEXPIRE', meta_key, ttl_ms)
+        redis.call('PEXPIRE', roster_key, ttl_ms)
+        redis.call('PEXPIRE', checked_key, ttl_ms)
+        redis.call('PEXPIRE', frozen_key, ttl_ms)
+        redis.call('PEXPIRE', events_key, ttl_ms)
+        redis.call('PEXPIRE', cancel_key, ttl_ms)
+        redis.call('PEXPIRE', gmap_key, ttl_ms)
+        redis.call('PEXPIRE', gcheck_key, ttl_ms)
+        redis.call('PEXPIRE', idem_key, ttl_ms)
+        redis.call('PEXPIRE', idemidx_key, ttl_ms)
+        -- 同屏障的其它批量幂等记录随屏障一起顺延，保证延期后仍可重试回放。
+        local others = redis.call('SMEMBERS', idemidx_key)
+        for _, other in ipairs(others) do
+            redis.call('PEXPIRE', other, ttl_ms)
+        end
+    end
+end
+
+if redis.call('HEXISTS', meta_key, 'threshold') == 0 then
+    return {'unknown'}
+end
+
+-- 幂等回放：同一幂等键的首次结果（含完整视图快照）原样返回，不做任何写入。
+local existing = redis.call('HGET', idem_key, 'record')
+if existing then
+    local rec = cjson.decode(existing)
+    if rec.fingerprint ~= fp then
+        return {'conflict', rec.idempotency_key}
+    end
+    return {'replay', existing}
+end
+
+local pids = cjson.decode(pids_json)
+
+-- 先把全部成员校验完再动任何状态：名单校验优先于终态/截止校验，与单人报到一致。
+-- 任一成员不在（替补后的）名单内即整批拒绝，checked/gcheck/events 均不触碰。
+for _, pid in ipairs(pids) do
+    if redis.call('SISMEMBER', roster_key, pid) == 0 then
+        return {'not_participant', pid}
+    end
+end
+
+-- 组装首次执行后重建完整视图所需的全部快照字段（终态/迟到/等待通用）。
+local function build_snapshot(view_status, late_only, quorum, frozen_at)
+    -- HGETALL 返回扁平 {field, value, ...}，统一转成映射便于回放端直接消费。
+    local function hgetall_map(key)
+        local flat = redis.call('HGETALL', key)
+        local map = {}
+        for i = 1, #flat, 2 do map[flat[i]] = flat[i + 1] end
+        return map
+    end
+    local gmap_map = hgetall_map(gmap_key)
+    local gcounts_raw = hgetall_map(gcheck_key)
+    local gcounts_map = {}
+    for group, value in pairs(gcounts_raw) do
+        gcounts_map[group] = tonumber(value)
+    end
+    local snap = {
+        view_status = view_status,
+        threshold = tonumber(redis.call('HGET', meta_key, 'threshold')),
+        deadline = tonumber(redis.call('HGET', meta_key, 'deadline')),
+        created_at = tonumber(redis.call('HGET', meta_key, 'created_at')),
+        participants = redis.call('SMEMBERS', roster_key),
+        checked_in = redis.call('SMEMBERS', checked_key),
+        creator = redis.call('HGET', meta_key, 'creator_id') or false,
+        gmap = gmap_map,
+        gcounts = gcounts_map,
+    }
+    table.sort(snap.participants)
+    table.sort(snap.checked_in)
+    local qraw = redis.call('HGET', meta_key, 'group_thresholds')
+    if qraw and qraw ~= '' then
+        snap.quotas = cjson.decode(qraw)
+    end
+    if quorum then
+        -- reached 视图的 checked_count 取冻结人数；late 为冻结之外的迟到名单。
+        snap.quorum = quorum
+        snap.frozen_at = frozen_at
+        if late_only then
+            local qset = {}
+            for _, m in ipairs(quorum) do qset[m] = true end
+            local late = {}
+            for _, m in ipairs(snap.checked_in) do
+                if not qset[m] then table.insert(late, m) end
+            end
+            snap.late = late
+        end
+    end
+    if view_status == 'expired' then
+        -- 理论上不可达（截止在写入前已被拒绝），保留分支以明确状态机语义。
+        local checked_set, missing = {}, {}
+        for _, m in ipairs(snap.checked_in) do checked_set[m] = true end
+        for _, m in ipairs(snap.participants) do
+            if not checked_set[m] then table.insert(missing, m) end
+        end
+        snap.missing = missing
+    end
+    return snap
+end
+
+local accepted = {}
+local status = 'checked_in'
+local triggered = false
+local quorum = false
+local frozen_at = false
+
+-- 终态一：达标冻结之后的批量报到 —— 成员逐个追加为迟到，冻结快照永不改写。
+local quorum_json = redis.call('HGET', frozen_key, 'quorum')
+if quorum_json then
+    for _, pid in ipairs(pids) do
+        redis.call('SADD', checked_key, pid)
+        local seq = redis.call('LLEN', events_key) + 1
+        redis.call('RPUSH', events_key, cjson.encode({
+            seq = seq, participant_id = pid, result = 'late', ts = now
+        }))
+        table.insert(accepted, {participant_id = pid, result = 'late'})
+    end
+    status = 'late'
+    quorum = cjson.decode(quorum_json)
+    frozen_at = tonumber(redis.call('HGET', frozen_key, 'frozen_at'))
+else
+    -- 终态二：取消快照已存在，整批拒绝（连 checked 也不追加）。
+    if redis.call('HEXISTS', cancel_key, 'cancelled_at') == 1 then
+        return {'cancelled'}
+    end
+
+    -- 终态三：已过当前截止时间（expired 不落键，靠时间判定），整批拒绝。
+    local deadline = tonumber(redis.call('HGET', meta_key, 'deadline'))
+    if now >= deadline then
+        return {'expired'}
+    end
+
+    -- 整批去重写入：仅首次进入 checked 的成员累计总数与分组计数。
+    local newly = {}
+    for _, pid in ipairs(pids) do
+        if redis.call('SADD', checked_key, pid) == 1 then
+            local group = redis.call('HGET', gmap_key, pid)
+            if group then
+                redis.call('HINCRBY', gcheck_key, group, 1)
+            end
+            newly[pid] = true
+        end
+    end
+
+    local count = redis.call('SCARD', checked_key)
+    local threshold = tonumber(redis.call('HGET', meta_key, 'threshold'))
+
+    -- 分组配额是否全部满足（与单人报到脚本同一判定）。
+    local function quotas_satisfied()
+        local raw = redis.call('HGET', meta_key, 'group_thresholds')
+        if not raw or raw == '' then
+            return true
+        end
+        local thresholds = cjson.decode(raw)
+        for group, need in pairs(thresholds) do
+            if tonumber(redis.call('HGET', gcheck_key, group) or '0') < tonumber(need) then
+                return false
+            end
+        end
+        return true
+    end
+
+    local reached_now = count >= threshold and quotas_satisfied()
+
+    if reached_now then
+        -- 本批首次同时满足「总数达标 + 各组配额达标」：在同一脚本内冻结
+        -- quorum 与分组计数。与单人报到脚本互斥共用 frozen 键，跨接口并发
+        -- 也只有唯一一次冻结。达标标记记在本批最后一个新报到成员上
+        -- （新成员为空则不可能由本批首次触发达标）。
+        local members = redis.call('SMEMBERS', checked_key)
+        table.sort(members)
+        local counts = redis.call('HGETALL', gcheck_key)
+        local counts_map = {}
+        for i = 1, #counts, 2 do
+            counts_map[counts[i]] = tonumber(counts[i + 1])
+        end
+        redis.call('HSET', frozen_key,
+            'quorum', cjson.encode(members),
+            'frozen_at', tostring(now),
+            'group_counts', cjson.encode(counts_map))
+
+        local trigger_pid = false
+        for i = #pids, 1, -1 do
+            if newly[pids[i]] then trigger_pid = pids[i]; break end
+        end
+        for _, pid in ipairs(pids) do
+            local result
+            if pid == trigger_pid then
+                result = 'reached'
+            elseif newly[pid] then
+                result = 'checked_in'
+            else
+                result = 'already_checked_in'
+            end
+            local seq = redis.call('LLEN', events_key) + 1
+            redis.call('RPUSH', events_key, cjson.encode({
+                seq = seq, participant_id = pid, result = result, ts = now
+            }))
+            table.insert(accepted, {participant_id = pid, result = result})
+        end
+        status = 'reached'
+        triggered = true
+        quorum = members
+        frozen_at = now
+    else
+        for _, pid in ipairs(pids) do
+            local result = newly[pid] and 'checked_in' or 'already_checked_in'
+            local seq = redis.call('LLEN', events_key) + 1
+            redis.call('RPUSH', events_key, cjson.encode({
+                seq = seq, participant_id = pid, result = result, ts = now
+            }))
+            table.insert(accepted, {participant_id = pid, result = result})
+        end
+    end
+end
+
+-- 操作状态（checked_in）与屏障视图状态（waiting）不同：reached/late 对应
+-- reached 视图，其余成功路径视图仍为 waiting。
+local view_status = 'waiting'
+if status == 'reached' or status == 'late' then
+    view_status = 'reached'
+end
+local snapshot = build_snapshot(
+    view_status,
+    status == 'late',
+    quorum,
+    frozen_at
+)
+local record = {
+    status = status,
+    triggered = triggered,
+    accepted = accepted,
+    quorum = quorum,
+    frozen_at = frozen_at,
+    idempotency_key = idem_key_arg,
+    fingerprint = fp,
+    snapshot = snapshot,
+}
+local record_json = cjson.encode(record)
+
+-- 幂等记录与报到结果在同一原子操作内落盘：要么首次结果与其重放凭证同时
+-- 可见，要么都不可见。重试只回放此记录，绝不再次执行报到。
+redis.call('HSET', idem_key, 'record', record_json)
+redis.call('SADD', idemidx_key, idem_key)
+refresh_ttl()
+
+return {'ok', record_json}
+"""
+
+
 class BarrierNotFound(Exception):
     """屏障不存在或已过期清理。"""
 
@@ -452,6 +771,17 @@ class ReplacementInRoster(Exception):
 
 class BarrierSubstituteConflict(Exception):
     """替补被拒绝：屏障已进入终态（reached/cancelled/expired）。"""
+
+
+class BatchNotParticipant(Exception):
+    """批量报到被整批拒绝：存在名单外（未知）成员，不产生任何报到副作用。
+
+    参数携带第一个被发现的名单外标识，用于错误文案。
+    """
+
+
+class IdempotencyConflict(Exception):
+    """同一幂等键已用于另一份参与者列表；首次结果不可被改写。"""
 
 
 @dataclass(frozen=True)
@@ -517,6 +847,31 @@ class SubstituteResult:
     replaced_at: float
 
 
+@dataclass(frozen=True)
+class BatchParticipant:
+    participant_id: str
+    # checked_in | already_checked_in | reached | late
+    result: str
+
+
+@dataclass(frozen=True)
+class BatchCheckinResult:
+    """批量报到首次执行结果（幂等重放在 API 层以 replayed=True 回放同一份）。"""
+
+    status: str  # checked_in | reached | late
+    triggered: bool
+    accepted: tuple[BatchParticipant, ...]
+    quorum: list[str] | None
+    frozen_at: float | None
+    idempotency_key: str
+    # 首次执行后可重建完整 BarrierView 的全部字段快照
+    snapshot: dict[str, Any]
+
+    @property
+    def replayed(self) -> bool:
+        return False
+
+
 class BarrierStore:
     def __init__(self, redis: Redis) -> None:
         self.redis = redis
@@ -524,10 +879,17 @@ class BarrierStore:
         self._cancel = redis.register_script(CANCEL_SCRIPT)
         self._extend = redis.register_script(EXTEND_SCRIPT)
         self._substitute = redis.register_script(SUBSTITUTE_SCRIPT)
+        self._batch_checkin = redis.register_script(BATCH_CHECKIN_SCRIPT)
 
     @staticmethod
     def channel(barrier_id: str) -> str:
         return f"barrier:{barrier_id}:events"
+
+    @staticmethod
+    def idempotency_key(barrier_id: str, key: str) -> str:
+        """幂等键落 Redis 的物理键名：sha256 摘要避免任意内容进入键空间。"""
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        return f"barrier:{barrier_id}:idem:{digest}"
 
     def _keys(self, barrier_id: str) -> tuple[str, ...]:
         return (
@@ -540,6 +902,20 @@ class BarrierStore:
             f"barrier:{barrier_id}:gmap",
             f"barrier:{barrier_id}:gcheck",
         )
+
+    def _extend_keys(self, barrier_id: str) -> list[str]:
+        # 延期脚本支持 9 个键：额外携带幂等记录索引，随延期顺延所有批量记录。
+        return [
+            *self._keys(barrier_id),
+            f"barrier:{barrier_id}:idem:idx",
+        ]
+
+    def _batch_keys(self, barrier_id: str, idempotency_key: str) -> list[str]:
+        return [
+            *self._keys(barrier_id),
+            idempotency_key,
+            f"barrier:{barrier_id}:idem:idx",
+        ]
 
     async def create(
         self,
@@ -703,9 +1079,9 @@ class BarrierStore:
         抛出 :class:`BarrierNotFound`。成功后发布 ``deadline_extended``，
         唤醒 /wait 等待者回读最新 deadline，终态绝不会被复活。
         """
-        keys = self._keys(barrier_id)
+        keys = self._extend_keys(barrier_id)
         raw = await self._extend(
-            keys=list(keys),
+            keys=keys,
             args=[
                 f"{new_deadline_ts:.3f}",
                 f"{(now if now is not None else time.time()):.3f}",
@@ -785,6 +1161,91 @@ class BarrierStore:
         # 发布丢失也无碍：等待者的轮询兜底同样会回读最新状态。
         await self.redis.publish(self.channel(barrier_id), "participant_replaced")
         return result
+
+    @staticmethod
+    def _batch_fingerprint(participants: list[str]) -> str:
+        """参与者集合指纹：同集合不同顺序视为同一幂等请求的重试。"""
+        return hashlib.sha256(
+            json.dumps(sorted(participants), ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+
+    async def batch_checkin(
+        self,
+        barrier_id: str,
+        participants: list[str],
+        idempotency_key: str,
+        now: float | None = None,
+    ) -> tuple[BatchCheckinResult, bool]:
+        """批量幂等报到；名单/终态/截止校验、整批写入、达标冻结与幂等记录
+        在同一段 Lua 脚本内原子完成。
+
+        返回 ``(result, replayed)``：
+
+        - 同一 ``idempotency_key`` 的首次执行：整批去重写入，必要时在脚本内
+          冻结 quorum，并把**首次完整结果快照**与幂等键在同一原子操作内落盘，
+          ``replayed=False``；
+        - 同一幂等键重试：不再次执行任何报到写入，逐字段回放首次结果，
+          ``replayed=True``；
+        - 同键但参与者集合不同 → :class:`IdempotencyConflict`；
+        - 列表含未知成员 → :class:`BatchNotParticipant`，**整批零副作用**
+          （不写 checked/gcheck/events，也不占用幂等键）；
+        - 已截止 / 已取消 → :class:`BarrierExpired` / :class:`BarrierCancelled`，
+          同样整批零副作用；屏障不存在 → :class:`BarrierNotFound`。
+
+        屏障已达标后的批量报到按迟到处理（status=late），不改变冻结快照，
+        仍会保存幂等记录并重放。仅首次执行真正触发达标时发布 ``reached``。
+        """
+        ts = f"{(now if now is not None else time.time()):.3f}"
+        idem_key = self.idempotency_key(barrier_id, idempotency_key)
+        raw = await self._batch_checkin(
+            keys=self._batch_keys(barrier_id, idem_key),
+            args=[
+                json.dumps(participants, ensure_ascii=False),
+                ts,
+                idempotency_key,
+                self._batch_fingerprint(participants),
+            ],
+        )
+        status = raw[0]
+
+        if status == "unknown":
+            raise BarrierNotFound(barrier_id)
+        if status == "conflict":
+            raise IdempotencyConflict(raw[1])
+        if status == "not_participant":
+            raise BatchNotParticipant(raw[1])
+        if status == "expired":
+            raise BarrierExpired(barrier_id)
+        if status == "cancelled":
+            raise BarrierCancelled(barrier_id)
+
+        record = json.loads(raw[1])
+        result = BatchCheckinResult(
+            status=record["status"],
+            triggered=bool(record["triggered"]),
+            accepted=tuple(
+                BatchParticipant(
+                    participant_id=item["participant_id"], result=item["result"]
+                )
+                for item in record["accepted"]
+            ),
+            quorum=record.get("quorum") or None,
+            frozen_at=(
+                float(record["frozen_at"])
+                if record.get("frozen_at") not in (None, False)
+                else None
+            ),
+            idempotency_key=record["idempotency_key"],
+            snapshot=record["snapshot"],
+        )
+        replayed = status == "replay"
+
+        # 冻结只可能发生在首次执行的脚本内部；重放不再广播，等待者早已被
+        # 首次执行唤醒（即便消息丢失，轮询兜底也会读到 reached 终态）。
+        if not replayed and result.status == "reached":
+            await self.redis.publish(self.channel(barrier_id), "reached")
+
+        return result, replayed
 
     async def get_frozen(self, barrier_id: str) -> dict[str, Any] | None:
         _, _, _, frozen_key, _, _, _, _ = self._keys(barrier_id)
