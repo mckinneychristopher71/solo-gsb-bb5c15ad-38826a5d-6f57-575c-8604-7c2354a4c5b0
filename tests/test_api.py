@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from collections import Counter
@@ -567,17 +568,18 @@ async def test_cancel_and_trigger_checkin_race_exactly_one_terminal_state():
                 f"barrier:{bid}:cancel",
                 f"barrier:{bid}:gmap",
                 f"barrier:{bid}:gcheck",
+                f"barrier:{bid}:batches",
             ]
             now = f"{time.time():.3f}"
             # 两个脚本放入同一个事务：EXEC 时 Redis 按入队顺序串行执行，
             # 交替顺序即可稳定覆盖“先达标”与“先取消”两个方向。
             pipe = r.pipeline(transaction=True)
             if i % 2 == 0:
-                pipe.eval(CHECKIN_SCRIPT, 8, *keys, "a", now)
-                pipe.eval(CANCEL_SCRIPT, 8, *keys, "race", now)
+                pipe.eval(CHECKIN_SCRIPT, 9, *keys, "a", now)
+                pipe.eval(CANCEL_SCRIPT, 9, *keys, "race", now)
             else:
-                pipe.eval(CANCEL_SCRIPT, 8, *keys, "race", now)
-                pipe.eval(CHECKIN_SCRIPT, 8, *keys, "a", now)
+                pipe.eval(CANCEL_SCRIPT, 9, *keys, "race", now)
+                pipe.eval(CHECKIN_SCRIPT, 9, *keys, "a", now)
             first, second = await pipe.execute()
 
             g = await c.get(f"/barriers/{bid}")
@@ -1220,6 +1222,7 @@ async def test_extend_and_cancel_checkin_races_have_unique_outcome():
                 f"barrier:{bid}:cancel",
                 f"barrier:{bid}:gmap",
                 f"barrier:{bid}:gcheck",
+                f"barrier:{bid}:batches",
             ]
             now = f"{time.time():.3f}"
             new_deadline = f"{time.time() + 120:.3f}"
@@ -1227,16 +1230,16 @@ async def test_extend_and_cancel_checkin_races_have_unique_outcome():
             mode = i % 3
             if mode == 0:
                 # 先延期后报到：延期成功，随后报到达标
-                pipe.eval(EXTEND_SCRIPT, 8, *keys, new_deadline, now, "86400000")
-                pipe.eval(CHECKIN_SCRIPT, 8, *keys, "a", now)
+                pipe.eval(EXTEND_SCRIPT, 9, *keys, new_deadline, now, "86400000")
+                pipe.eval(CHECKIN_SCRIPT, 9, *keys, "a", now)
             elif mode == 1:
                 # 先报达标后延期：延期必须报 reached 冲突，快照不变
-                pipe.eval(CHECKIN_SCRIPT, 8, *keys, "a", now)
-                pipe.eval(EXTEND_SCRIPT, 8, *keys, new_deadline, now, "86400000")
+                pipe.eval(CHECKIN_SCRIPT, 9, *keys, "a", now)
+                pipe.eval(EXTEND_SCRIPT, 9, *keys, new_deadline, now, "86400000")
             else:
                 # 先延期后取消：延期成功，取消随后生效（waiting 中允许取消）
-                pipe.eval(EXTEND_SCRIPT, 8, *keys, new_deadline, now, "86400000")
-                pipe.eval(CANCEL_SCRIPT, 8, *keys, "race", now)
+                pipe.eval(EXTEND_SCRIPT, 9, *keys, new_deadline, now, "86400000")
+                pipe.eval(CANCEL_SCRIPT, 9, *keys, "race", now)
             first_raw, second_raw = await pipe.execute()
 
             g = await c.get(f"/barriers/{bid}")
@@ -1590,17 +1593,18 @@ async def test_replace_and_checkin_race_unique_outcome():
                 f"barrier:{bid}:cancel",
                 f"barrier:{bid}:gmap",
                 f"barrier:{bid}:gcheck",
+                f"barrier:{bid}:batches",
             ]
             now = f"{time.time():.3f}"
             pipe = r.pipeline(transaction=True)
             if i % 2 == 0:
                 # 先替补后报到：替补成功；原成员 a 已不在名单，报到必为 not_participant
-                pipe.eval(SUBSTITUTE_SCRIPT, 8, *keys, "a", "a-new", now)
-                pipe.eval(CHECKIN_SCRIPT, 8, *keys, "a", now)
+                pipe.eval(SUBSTITUTE_SCRIPT, 9, *keys, "a", "a-new", now)
+                pipe.eval(CHECKIN_SCRIPT, 9, *keys, "a", now)
             else:
                 # 先报到（达标）后替补：报到 reached；替补必为 reached 冲突
-                pipe.eval(CHECKIN_SCRIPT, 8, *keys, "a", now)
-                pipe.eval(SUBSTITUTE_SCRIPT, 8, *keys, "a", "a-new", now)
+                pipe.eval(CHECKIN_SCRIPT, 9, *keys, "a", now)
+                pipe.eval(SUBSTITUTE_SCRIPT, 9, *keys, "a", "a-new", now)
             first_raw, second_raw = await pipe.execute()
 
             g = await c.get(f"/barriers/{bid}")
@@ -1654,23 +1658,24 @@ async def test_replace_races_with_cancel_and_extend():
                 f"barrier:{bid}:cancel",
                 f"barrier:{bid}:gmap",
                 f"barrier:{bid}:gcheck",
+                f"barrier:{bid}:batches",
             ]
             now = f"{time.time():.3f}"
             new_deadline = f"{time.time() + 120:.3f}"
             pipe = r.pipeline(transaction=True)
             mode = i % 4
             if mode == 0:
-                pipe.eval(SUBSTITUTE_SCRIPT, 8, *keys, "b", "b-new", now)
-                pipe.eval(CANCEL_SCRIPT, 8, *keys, "race", now)
+                pipe.eval(SUBSTITUTE_SCRIPT, 9, *keys, "b", "b-new", now)
+                pipe.eval(CANCEL_SCRIPT, 9, *keys, "race", now)
             elif mode == 1:
-                pipe.eval(CANCEL_SCRIPT, 8, *keys, "race", now)
-                pipe.eval(SUBSTITUTE_SCRIPT, 8, *keys, "b", "b-new", now)
+                pipe.eval(CANCEL_SCRIPT, 9, *keys, "race", now)
+                pipe.eval(SUBSTITUTE_SCRIPT, 9, *keys, "b", "b-new", now)
             elif mode == 2:
-                pipe.eval(SUBSTITUTE_SCRIPT, 8, *keys, "b", "b-new", now)
-                pipe.eval(EXTEND_SCRIPT, 8, *keys, new_deadline, now, "86400000")
+                pipe.eval(SUBSTITUTE_SCRIPT, 9, *keys, "b", "b-new", now)
+                pipe.eval(EXTEND_SCRIPT, 9, *keys, new_deadline, now, "86400000")
             else:
-                pipe.eval(EXTEND_SCRIPT, 8, *keys, new_deadline, now, "86400000")
-                pipe.eval(SUBSTITUTE_SCRIPT, 8, *keys, "b", "b-new", now)
+                pipe.eval(EXTEND_SCRIPT, 9, *keys, new_deadline, now, "86400000")
+                pipe.eval(SUBSTITUTE_SCRIPT, 9, *keys, "b", "b-new", now)
             first_raw, second_raw = await pipe.execute()
 
             g = (await c.get(f"/barriers/{bid}")).json()
@@ -1734,3 +1739,470 @@ async def test_waiter_woken_on_replace_and_sees_new_roster():
         assert body["participants"] == ["a", "b-new"]
         assert elapsed < 5
 
+
+
+# ---------------------------------------------------------------------------
+# 批量幂等报到 POST /barriers/{id}/checkin/batch
+# ---------------------------------------------------------------------------
+
+
+async def batch_checkin(client: AsyncClient, bid: str, key: str, pids):
+    return await client.post(
+        f"/barriers/{bid}/checkin/batch",
+        json={"idempotency_key": key, "participant_ids": pids},
+    )
+
+
+@pytest.mark.asyncio
+async def test_batch_checkin_basic_dedup_and_openapi():
+    """批量报到基本路径：列表清洗（去空白/去重）、added 准确、视图与事件一致；
+    接口出现在 OpenAPI schema 与根路由中。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b", "c", "d"], threshold=3, ttl_s=10)
+        bid = b["barrier_id"]
+
+        # 请求列表含重复与首尾空白：按创建名单同一套规则清洗
+        r = await batch_checkin(c, bid, "k1", ["a", " b ", "b", "a"])
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["barrier_id"] == bid
+        assert body["idempotency_key"] == "k1"
+        assert body["status"] == "checked_in"
+        assert body["replayed"] is False
+        assert body["triggered"] is False
+        assert body["added"] == ["a", "b"]
+        assert body["quorum"] is None and body["frozen_at"] is None
+        view = body["view"]
+        assert view["status"] == "waiting"
+        assert view["checked_in"] == ["a", "b"]
+        assert view["checked_count"] == 2
+
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["checked_in"] == ["a", "b"]
+
+        # 每个成员各产生一条 checked_in 事件
+        events = (await get_events(c, bid)).json()["events"]
+        assert [e["seq"] for e in events] == [1, 2]
+        assert [e["participant_id"] for e in events] == ["a", "b"]
+        assert [e["result"] for e in events] == ["checked_in", "checked_in"]
+
+        # OpenAPI schema 与根路由都暴露批量报到接口
+        spec = (await c.get("/openapi.json")).json()
+        path = spec["paths"]["/barriers/{barrier_id}/checkin/batch"]["post"]
+        assert path["responses"]["200"]["description"]
+        root = (await c.get("/")).json()
+        assert "checkin_batch" in root["endpoints"]
+
+
+@pytest.mark.asyncio
+async def test_batch_idempotency_key_replay_returns_first_result():
+    """同一幂等键重试原样返回首次结果：不重复计数、不重复记录事件；
+    同键不同列表也返回首次结果，新列表不产生任何副作用。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b", "c"], threshold=2, ttl_s=10)
+        bid = b["barrier_id"]
+
+        r1 = await batch_checkin(c, bid, "k1", ["a", "b"])
+        assert r1.status_code == 200
+        first = r1.json()
+        assert first["status"] == "reached"
+        assert first["triggered"] is True
+        assert first["replayed"] is False
+        assert first["added"] == ["a", "b"]
+        assert sorted(first["quorum"]) == ["a", "b"]
+
+        # 同键同列表重试：逐字段一致，仅 replayed 标记不同
+        r2 = await batch_checkin(c, bid, "k1", ["a", "b"])
+        second = r2.json()
+        assert second["replayed"] is True
+        for field in ("status", "triggered", "added", "quorum", "frozen_at"):
+            assert second[field] == first[field], field
+
+        # 同键不同列表：仍返回首次结果，c 不会被写入
+        r3 = await batch_checkin(c, bid, "k1", ["c"])
+        third = r3.json()
+        assert third["replayed"] is True
+        assert third["added"] == ["a", "b"]
+        assert sorted(third["quorum"]) == ["a", "b"]
+
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["checked_in"] == ["a", "b"]  # 重放与新列表均未写入 c
+        assert g["checked_count"] == 2
+
+        # 事件不因重放重复：仍只有首次的 2 条
+        events = (await get_events(c, bid)).json()["events"]
+        assert len(events) == 2
+        assert [e["result"] for e in events] == ["checked_in", "reached"]
+
+
+@pytest.mark.asyncio
+async def test_batch_unknown_member_no_side_effects_and_key_reusable():
+    """列表含未知成员：整批 403 且零副作用（不写报到、无事件），
+    幂等键不被消耗，修正名单后同键重试可正常生效。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=10)
+        bid = b["barrier_id"]
+
+        r = await batch_checkin(c, bid, "k1", ["a", "ghost"])
+        assert r.status_code == 403, r.text
+        assert "ghost" in r.json()["detail"]
+
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["status"] == "waiting"
+        assert g["checked_in"] == []
+        assert g["checked_count"] == 0
+        assert (await get_events(c, bid)).json()["events"] == []
+
+        # 幂等键未被消耗：修正名单后用同一键重试，整批正常生效
+        r2 = await batch_checkin(c, bid, "k1", ["a", "b"])
+        assert r2.status_code == 200
+        body = r2.json()
+        assert body["status"] == "reached"
+        assert body["replayed"] is False
+        assert body["added"] == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_batch_expired_and_cancelled_no_side_effects():
+    """已截止 / 已取消：整批 409 且零副作用，不写任何报到状态。"""
+    async with await _client() as c:
+        # 已截止
+        b = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=1)
+        bid = b["barrier_id"]
+        await asyncio.sleep(1.2)
+        r = await batch_checkin(c, bid, "k-exp", ["a", "b"])
+        assert r.status_code == 409
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["status"] == "expired"
+        assert g["checked_in"] == []
+        assert g["missing"] == ["a", "b"]
+        assert (await get_events(c, bid)).json()["events"] == []
+
+        # 已取消
+        b2 = await create_barrier(c, ["x", "y"], threshold=2, ttl_s=10)
+        bid2 = b2["barrier_id"]
+        await checkin(c, bid2, "x")
+        await cancel(c, bid2, "停")
+        r = await batch_checkin(c, bid2, "k-cancel", ["x", "y"])
+        assert r.status_code == 409
+        g = (await c.get(f"/barriers/{bid2}")).json()
+        assert g["status"] == "cancelled"
+        assert g["checked_in"] == ["x"]  # 仅有取消前的报到
+        events = (await get_events(c, bid2)).json()["events"]
+        assert [e["result"] for e in events] == ["checked_in"]
+
+        # 屏障不存在 -> 404
+        r = await batch_checkin(c, "deadbeefdeadbeef", "k1", ["a"])
+        assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_batch_concurrent_distinct_keys_freeze_exactly_once():
+    """不同幂等键的并发批量报到：只有一个请求 triggered=true 并冻结 quorum，
+    其余为 checked_in / late；冻结快照唯一确定。"""
+    async with await _client() as c:
+        members = [f"m{i}" for i in range(6)]
+        b = await create_barrier(c, members, threshold=4, ttl_s=10)
+        bid = b["barrier_id"]
+
+        results = await asyncio.gather(
+            batch_checkin(c, bid, "k1", ["m0", "m1"]),
+            batch_checkin(c, bid, "k2", ["m2", "m3"]),
+            batch_checkin(c, bid, "k3", ["m4", "m5"]),
+        )
+        assert all(r.status_code == 200 for r in results), results
+        bodies = [r.json() for r in results]
+
+        triggered = [x for x in bodies if x["triggered"]]
+        assert len(triggered) == 1, bodies
+        assert [x for x in bodies if x["status"] == "reached"] == triggered
+        assert {x["status"] for x in bodies} <= {"checked_in", "reached", "late"}
+
+        quorum = triggered[0]["quorum"]
+        assert len(quorum) == 4
+        frozen_at = triggered[0]["frozen_at"]
+
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["status"] == "reached"
+        assert g["quorum"] == quorum
+        assert g["frozen_at"] == frozen_at
+        assert set(g["checked_in"]) == set(members)
+        assert set(g["late"]) == set(members) - set(quorum)
+
+        # 全局恰好一条 reached 事件；事件总数 = 6（每人一条）
+        events = (await get_events(c, bid)).json()["events"]
+        assert len(events) == 6
+        assert sum(1 for e in events if e["result"] == "reached") == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_concurrent_same_key_executes_exactly_once():
+    """同一幂等键并发重试：恰好一个请求真正执行，其余全部重放同一结果，
+    报到集合与审计事件都只产生一份。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b", "c"], threshold=3, ttl_s=10)
+        bid = b["barrier_id"]
+
+        results = await asyncio.gather(
+            *(batch_checkin(c, bid, "same-key", ["a", "b", "c"]) for _ in range(5))
+        )
+        assert all(r.status_code == 200 for r in results)
+        bodies = [r.json() for r in results]
+
+        fresh = [x for x in bodies if not x["replayed"]]
+        replays = [x for x in bodies if x["replayed"]]
+        assert len(fresh) == 1, bodies
+        assert len(replays) == 4
+
+        first = fresh[0]
+        assert first["status"] == "reached" and first["triggered"] is True
+        for x in replays:
+            assert x["status"] == first["status"]
+            assert x["quorum"] == first["quorum"]
+            assert x["frozen_at"] == first["frozen_at"]
+            assert x["added"] == first["added"]
+
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["checked_in"] == ["a", "b", "c"]
+        assert g["checked_count"] == 3
+        events = (await get_events(c, bid)).json()["events"]
+        assert len(events) == 3  # 5 个并发请求只产生 3 条事件
+
+
+@pytest.mark.asyncio
+async def test_batch_late_after_reach_keeps_snapshot():
+    """达标后整批记为 late：新成员写入迟到名单，quorum / frozen_at 不变。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b", "c", "d"], threshold=2, ttl_s=10)
+        bid = b["barrier_id"]
+        cr = await checkin(c, bid, "a")
+        cr = await checkin(c, bid, "b")
+        assert cr.json()["status"] == "reached"
+        frozen_at = cr.json()["frozen_at"]
+
+        r = await batch_checkin(c, bid, "k-late", ["c", "d"])
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "late"
+        assert body["triggered"] is False
+        assert body["replayed"] is False
+        assert body["added"] == ["c", "d"]
+        assert sorted(body["quorum"]) == ["a", "b"]
+        assert body["frozen_at"] == frozen_at
+
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["quorum"] == ["a", "b"]
+        assert g["frozen_at"] == frozen_at
+        assert g["late"] == ["c", "d"]
+
+        events = (await get_events(c, bid)).json()["events"]
+        assert [e["result"] for e in events] == [
+            "checked_in", "reached", "late", "late",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_batch_with_group_quotas():
+    """分组配额屏障：总人数够但组配额不足时整批仍 waiting；
+    补齐短板组的批次唯一触发达标，分组计数不重复累计。"""
+    async with await _client() as c:
+        participants = ["a1", "a2", "b1"]
+        groups = {"a1": "A", "a2": "A", "b1": "B"}
+        b = await create_barrier(
+            c, participants, threshold=2, ttl_s=15,
+            groups=groups, quotas={"A": 1, "B": 1},
+        )
+        bid = b["barrier_id"]
+
+        # 整批两人都在 A 组：总数达标但 B 组配额未满 -> 仍 waiting
+        r = await batch_checkin(c, bid, "k1", ["a1", "a2"])
+        body = r.json()
+        assert body["status"] == "checked_in"
+        assert body["triggered"] is False
+        prog = {x["group"]: x for x in body["view"]["group_progress"]}
+        assert prog["A"]["checked_count"] == 2 and prog["A"]["satisfied"] is True
+        assert prog["B"]["checked_count"] == 0 and prog["B"]["satisfied"] is False
+
+        # 重复成员混在新批中：不重复累计分组计数
+        r = await batch_checkin(c, bid, "k2", ["a1", "b1"])
+        body = r.json()
+        assert body["status"] == "reached"
+        assert body["triggered"] is True
+        assert body["added"] == ["b1"]  # a1 已报到过，不在 added 中
+        assert sorted(body["quorum"]) == ["a1", "a2", "b1"]
+        prog = {x["group"]: x for x in body["view"]["group_progress"]}
+        assert prog["A"]["checked_count"] == 2  # a1 没有重复累计
+        assert prog["B"]["checked_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_events_per_member_and_mixed_results():
+    """逐成员事件：新报到 checked_in、已报到成员 already_checked_in、
+    达标事件落在本批最后一个新成员上；seq 连续不重不漏。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b", "c"], threshold=3, ttl_s=10)
+        bid = b["barrier_id"]
+
+        r = await batch_checkin(c, bid, "k1", ["a"])
+        assert r.json()["status"] == "checked_in"
+
+        # 混合批：a 已报到过（不重复计数），b/c 新报到并由 c 完成达标
+        r = await batch_checkin(c, bid, "k2", ["a", "b", "c"])
+        body = r.json()
+        assert body["status"] == "reached"
+        assert body["added"] == ["b", "c"]  # a 已报到过，不在 added 中
+        assert sorted(body["quorum"]) == ["a", "b", "c"]
+
+        events = (await get_events(c, bid)).json()["events"]
+        assert [e["seq"] for e in events] == [1, 2, 3, 4]
+        assert [(e["participant_id"], e["result"]) for e in events] == [
+            ("a", "checked_in"),
+            ("a", "already_checked_in"),
+            ("b", "checked_in"),
+            ("c", "reached"),  # 达标事件落在本批最后一个新报到成员
+        ]
+
+
+@pytest.mark.asyncio
+async def test_batch_request_validation_422():
+    """缺幂等键、空白键、超长键、空列表、列表含空白成员均返回 422。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=10)
+        bid = b["barrier_id"]
+
+        async def post(body):
+            return await c.post(f"/barriers/{bid}/checkin/batch", json=body)
+
+        assert (await post({"participant_ids": ["a"]})).status_code == 422
+        assert (await post({"idempotency_key": " ", "participant_ids": ["a"]})).status_code == 422
+        assert (await post({"idempotency_key": "x" * 201, "participant_ids": ["a"]})).status_code == 422
+        assert (await post({"idempotency_key": "k", "participant_ids": []})).status_code == 422
+        assert (await post({"idempotency_key": "k", "participant_ids": ["a", ""]})).status_code == 422
+        assert (await post({"idempotency_key": "k", "participant_ids": [" "]})).status_code == 422
+
+        # 全部校验失败都不产生副作用
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["checked_in"] == []
+        assert (await get_events(c, bid)).json()["events"] == []
+
+
+@pytest.mark.asyncio
+async def test_batch_waiters_woken_on_reach():
+    """批量达标唤醒所有挂起的等待者，返回同一份冻结快照。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=10)
+        bid = b["barrier_id"]
+
+        async def wait_view():
+            async with await _client() as c2:
+                started = time.time()
+                r = await c2.get(f"/barriers/{bid}/wait")
+                return time.time() - started, r
+
+        waiters = [asyncio.create_task(wait_view()) for _ in range(3)]
+        await asyncio.sleep(0.4)
+        r = await batch_checkin(c, bid, "k1", ["a", "b"])
+        assert r.json()["status"] == "reached"
+
+        outcomes = await asyncio.gather(*waiters)
+        for elapsed, r in outcomes:
+            assert r.status_code == 200
+            body = r.json()
+            assert body["status"] == "reached"
+            assert sorted(body["quorum"]) == ["a", "b"]
+            assert elapsed < 5, f"等待者未被及时唤醒: {elapsed:.2f}s"
+
+
+@pytest.mark.asyncio
+async def test_batch_race_with_checkin_and_cancel_unique_outcome():
+    """批量脚本与单人报到 / 取消脚本用同一事务固定入队顺序交替执行：
+    先执行者唯一胜出，终态唯一一致，败者无任何副作用。"""
+    from app.barrier_store import (
+        BATCH_CHECKIN_SCRIPT,
+        CANCEL_SCRIPT,
+        CHECKIN_SCRIPT,
+    )
+
+    async with await _client() as c:
+        r = app.state.store.redis
+        outcomes = []
+
+        for i in range(30):
+            b = await create_barrier(c, ["a", "b"], threshold=1, ttl_s=30)
+            bid = b["barrier_id"]
+            keys = [
+                f"barrier:{bid}",
+                f"barrier:{bid}:roster",
+                f"barrier:{bid}:checked",
+                f"barrier:{bid}:frozen",
+                f"barrier:{bid}:events",
+                f"barrier:{bid}:cancel",
+                f"barrier:{bid}:gmap",
+                f"barrier:{bid}:gcheck",
+                f"barrier:{bid}:batches",
+            ]
+            now = f"{time.time():.3f}"
+            pipe = r.pipeline(transaction=True)
+            mode = i % 3
+            if mode == 0:
+                # 先批量（达标）后单人：批量 reached；单人只能 late
+                pipe.eval(BATCH_CHECKIN_SCRIPT, 9, *keys, "ik", now, "1", "a")
+                pipe.eval(CHECKIN_SCRIPT, 9, *keys, "b", now)
+            elif mode == 1:
+                # 先单人（达标）后批量：批量只能 late，且不改写快照
+                pipe.eval(CHECKIN_SCRIPT, 9, *keys, "a", now)
+                pipe.eval(BATCH_CHECKIN_SCRIPT, 9, *keys, "ik", now, "1", "b")
+            else:
+                # 先取消后批量：批量整批拒绝，无任何副作用
+                pipe.eval(CANCEL_SCRIPT, 9, *keys, "race", now)
+                pipe.eval(BATCH_CHECKIN_SCRIPT, 9, *keys, "ik", now, "1", "a")
+            first_raw, second_raw = await pipe.execute()
+
+            g = (await c.get(f"/barriers/{bid}")).json()
+            if mode == 0:
+                assert first_raw[0] == "ok", first_raw
+                assert json.loads(first_raw[1])["status"] == "reached"
+                assert second_raw[0] == "late", second_raw
+                assert g["status"] == "reached"
+                assert g["quorum"] == ["a"]
+                assert g["late"] == ["b"]
+                outcomes.append("batch_first")
+            elif mode == 1:
+                assert first_raw[0] == "reached", first_raw
+                assert second_raw[0] == "ok", second_raw
+                assert g["status"] == "reached"
+                assert g["quorum"] == ["a"]  # 快照未被批量改写
+                assert g["late"] == ["b"]
+                outcomes.append("checkin_first")
+            else:
+                assert first_raw[0] == "cancelled", first_raw
+                assert second_raw[0] == "cancelled", second_raw
+                assert g["status"] == "cancelled"
+                assert g["checked_in"] == []  # 批量零副作用
+                outcomes.append("cancel_first")
+
+        assert set(outcomes) == {"batch_first", "checkin_first", "cancel_first"}
+
+
+@pytest.mark.asyncio
+async def test_batch_result_key_ttl_refreshed_on_extend():
+    """批量幂等结果键与屏障其他键同生命周期：延期后一并顺延，不会被提前回收。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=1)
+        bid = b["barrier_id"]
+        await batch_checkin(c, bid, "k1", ["a"])
+
+        r = app.state.store.redis
+        batches_key = f"barrier:{bid}:batches"
+        assert await r.exists(batches_key) == 1
+
+        new_dt = datetime.now(timezone.utc) + timedelta(seconds=30)
+        resp = await extend_deadline(c, bid, _iso(new_dt))
+        assert resp.status_code == 200
+
+        ttl = await r.pttl(batches_key)
+        assert ttl > 29000, f"batches 键 TTL 未随延期顺延: {ttl}ms"
+
+        # 幂等结果在延期后仍可重放
+        again = await batch_checkin(c, bid, "k1", ["a"])
+        assert again.json()["replayed"] is True

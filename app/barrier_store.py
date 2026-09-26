@@ -12,6 +12,8 @@
                             含报到事件与运行中替补事件）
 ``barrier:{bid}:gmap``      hash  参与者 -> 分组名（仅启用分组配额时存在）
 ``barrier:{bid}:gcheck``    hash  各分组去重后的报到人数（仅启用分组配额时存在）
+``barrier:{bid}:batches``   hash  批量报到幂等键 -> 首次执行结果 JSON
+                            （同一幂等键重试原样返回，绝不重复产生副作用）
 
 ``frozen`` 与 ``cancel`` 互斥：达标报到与主动取消由各自的 Lua 脚本原子竞争，
 Redis 单线程串行执行脚本，先发生者成为唯一终态，任何路径都不得改写。
@@ -19,8 +21,8 @@ Redis 单线程串行执行脚本，先发生者成为唯一终态，任何路�
 脚本与前两者同样地原子竞争：终态键（frozen/cancel）或已过截止的屏障一律
 拒绝延期与替补，绝不复活终态。
 
-频道 ``barrier:{bid}:events`` 在达标冻结后发布 ``reached`` 消息、
-在主动取消后发布 ``cancelled`` 消息、在成功延期后发布 ``deadline_extended``
+频道 ``barrier:{bid}:events`` 在达标冻结后（单人或批量报到触发）发布 ``reached``
+消息、在主动取消后发布 ``cancelled`` 消息、在成功延期后发布 ``deadline_extended``
 消息（通知挂起中的 /wait 回读最新 deadline 继续等待）、在成功替补后发布
 ``participant_replaced`` 消息（通知挂起中的 /wait 回读替换后的名单）。
 """
@@ -62,6 +64,7 @@ local events_key  = KEYS[5]
 local cancel_key  = KEYS[6]
 local gmap_key    = KEYS[7]
 local gcheck_key  = KEYS[8]
+local batches_key = KEYS[9]
 local pid         = ARGV[1]
 local now         = tonumber(ARGV[2])
 
@@ -76,6 +79,7 @@ local function refresh_ttl()
         redis.call('PEXPIRE', cancel_key, ttl_ms)
         redis.call('PEXPIRE', gmap_key, ttl_ms)
         redis.call('PEXPIRE', gcheck_key, ttl_ms)
+        redis.call('PEXPIRE', batches_key, ttl_ms)
     end
 end
 
@@ -184,6 +188,213 @@ return {'already_checked_in', '0', '', '0'}
 """
 
 
+# 批量报到脚本。ARGV：幂等键、当前时间、人数 n、紧随其后 n 个参与者标识。
+# 返回数组：
+#   {'unknown'}                     屏障不存在
+#   {'not_participant', unknowns}   列表含名单外成员（unknowns 为 JSON 数组）：
+#                                   整批拒绝，不产生任何副作用，幂等键不被消耗
+#   {'cancelled'}                   屏障已被主动取消：整批拒绝，无副作用
+#   {'expired'}                     已过截止时间：整批拒绝，无副作用
+#   {'ok', result}                  本次执行生效，result 为已持久化的结果 JSON
+#   {'replay', result}              同一幂等键重试：原样返回首次持久化的结果，
+#                                   本次不执行任何写操作
+#
+# result JSON：{status, added, ts, quorum?, frozen_at?}
+#   status = checked_in（整批已接受，屏障继续等待）
+#          | reached（本批使屏障达标，已原子写入冻结快照）
+#          | late（达标冻结之后才到，仅记录迟到，快照不变）
+#   added  = 本批实际新写入报到集合的成员（按请求顺序；已报到过的不在其中）
+#
+# 名单整体校验、终态校验、整批 SADD、分组计数、达标冻结、逐成员审计事件与
+# 幂等结果持久化全部在同一段脚本内原子完成：
+#   - 任一成员不在名单内、屏障已取消或已截止：整批没有任何报到副作用
+#     （不写 checked、不计分组、不产生事件、不消耗幂等键）；
+#   - 并发批量/单人报到下只有一段脚本能写入冻结快照，reached 全局唯一；
+#   - 同一幂等键的重试在脚本入口即被已存结果短路，绝不重复计数或重复记录事件。
+BATCH_CHECKIN_SCRIPT = """
+local meta_key    = KEYS[1]
+local roster_key  = KEYS[2]
+local checked_key = KEYS[3]
+local frozen_key  = KEYS[4]
+local events_key  = KEYS[5]
+local cancel_key  = KEYS[6]
+local gmap_key    = KEYS[7]
+local gcheck_key  = KEYS[8]
+local batches_key = KEYS[9]
+local ikey        = ARGV[1]
+local now         = tonumber(ARGV[2])
+local n           = tonumber(ARGV[3])
+
+local function refresh_ttl()
+    local ttl_ms = tonumber(redis.call('HGET', meta_key, 'ttl_ms'))
+    if ttl_ms then
+        redis.call('PEXPIRE', meta_key, ttl_ms)
+        redis.call('PEXPIRE', roster_key, ttl_ms)
+        redis.call('PEXPIRE', checked_key, ttl_ms)
+        redis.call('PEXPIRE', frozen_key, ttl_ms)
+        redis.call('PEXPIRE', events_key, ttl_ms)
+        redis.call('PEXPIRE', cancel_key, ttl_ms)
+        redis.call('PEXPIRE', gmap_key, ttl_ms)
+        redis.call('PEXPIRE', gcheck_key, ttl_ms)
+        redis.call('PEXPIRE', batches_key, ttl_ms)
+    end
+end
+
+-- 审计事件：与状态变更处于同一原子脚本，seq 自 1 递增（下标 = seq - 1）。
+local function record_event(pid, result)
+    local seq = redis.call('LLEN', events_key) + 1
+    redis.call('RPUSH', events_key, cjson.encode({
+        seq = seq,
+        participant_id = pid,
+        result = result,
+        ts = now
+    }))
+end
+
+-- 分组配额是否全部满足：与单人报到脚本同一判定。
+local function group_quotas_satisfied()
+    local raw = redis.call('HGET', meta_key, 'group_thresholds')
+    if not raw or raw == '' then
+        return true
+    end
+    local thresholds = cjson.decode(raw)
+    for group, need in pairs(thresholds) do
+        if tonumber(redis.call('HGET', gcheck_key, group) or '0') < tonumber(need) then
+            return false
+        end
+    end
+    return true
+end
+
+-- 冻结快照：quorum 成员名单 + 冻结瞬间的分组计数，一次原子写定，永不改写。
+local function freeze_quorum(now_ts)
+    local members = redis.call('SMEMBERS', checked_key)
+    table.sort(members)
+    local counts = redis.call('HGETALL', gcheck_key)
+    local counts_map = {}
+    for i = 1, #counts, 2 do
+        counts_map[counts[i]] = tonumber(counts[i + 1])
+    end
+    redis.call('HSET', frozen_key,
+        'quorum', cjson.encode(members),
+        'frozen_at', tostring(now_ts),
+        'group_counts', cjson.encode(counts_map))
+    return cjson.encode(members)
+end
+
+if redis.call('HEXISTS', meta_key, 'threshold') == 0 then
+    return {'unknown'}
+end
+
+-- 幂等键短路：首次执行的结果已持久化，重试原样返回，任何写操作都不再发生。
+local stored = redis.call('HGET', batches_key, ikey)
+if stored then
+    return {'replay', stored}
+end
+
+-- 名单整体校验优先于一切状态：任一成员不在名单内即整批拒绝，
+-- 不产生任何副作用，也不消耗幂等键（修正名单后可用同键重试）。
+local unknown = {}
+for i = 1, n do
+    if redis.call('SISMEMBER', roster_key, ARGV[3 + i]) == 0 then
+        unknown[#unknown + 1] = ARGV[3 + i]
+    end
+end
+if #unknown > 0 then
+    return {'not_participant', cjson.encode(unknown)}
+end
+
+-- 达标冻结之后：整批只记录迟到事实（含新写入 checked 的迟到成员），
+-- quorum / frozen_at / 分组计数快照均保持不变。
+local quorum = redis.call('HGET', frozen_key, 'quorum')
+if quorum then
+    local added = {}
+    for i = 1, n do
+        local pid = ARGV[3 + i]
+        if redis.call('SADD', checked_key, pid) == 1 then
+            added[#added + 1] = pid
+        end
+        record_event(pid, 'late')
+    end
+    local result = cjson.encode({
+        status = 'late',
+        added = added,
+        quorum = cjson.decode(quorum),
+        frozen_at = tonumber(redis.call('HGET', frozen_key, 'frozen_at')),
+        ts = now
+    })
+    redis.call('HSET', batches_key, ikey, result)
+    refresh_ttl()
+    return {'ok', result}
+end
+
+-- 主动取消之后：整批拒绝，不写任何状态（连 checked 也不追加），不消耗幂等键。
+if redis.call('HEXISTS', cancel_key, 'cancelled_at') == 1 then
+    return {'cancelled'}
+end
+
+local deadline = tonumber(redis.call('HGET', meta_key, 'deadline'))
+if now >= deadline then
+    return {'expired'}
+end
+
+-- 应用整批：去重后的新成员才写入 checked 并累计分组计数；
+-- 已报到过的成员不重复累计（与单人报到同一语义）。
+local added = {}
+local newly = {}
+for i = 1, n do
+    local pid = ARGV[3 + i]
+    if redis.call('SADD', checked_key, pid) == 1 then
+        added[#added + 1] = pid
+        newly[pid] = true
+        local group = redis.call('HGET', gmap_key, pid)
+        if group then
+            redis.call('HINCRBY', gcheck_key, group, 1)
+        end
+    end
+end
+
+local count = redis.call('SCARD', checked_key)
+local threshold = tonumber(redis.call('HGET', meta_key, 'threshold'))
+
+-- 首次同时满足「总数达标 + 各组配额达标」：在同一脚本内冻结成员名单与
+-- 分组计数；并发的批量/单人报到也只有这一段脚本能写入冻结快照。
+local status = 'checked_in'
+local quorum_json = nil
+if count >= threshold and group_quotas_satisfied() then
+    quorum_json = freeze_quorum(now)
+    status = 'reached'
+end
+
+-- 逐成员审计事件：与状态变更同一原子操作；达标事件落在本批最后一个新报到
+-- 成员上（等价于这些成员按顺序依次单人报到，全局仍只有一条 reached 事件）。
+local reached_pid = nil
+if status == 'reached' then
+    reached_pid = added[#added]
+end
+for i = 1, n do
+    local pid = ARGV[3 + i]
+    if pid == reached_pid then
+        record_event(pid, 'reached')
+    elseif newly[pid] then
+        record_event(pid, 'checked_in')
+    else
+        record_event(pid, 'already_checked_in')
+    end
+end
+
+local result_obj = {status = status, added = added, ts = now}
+if quorum_json then
+    result_obj.quorum = cjson.decode(quorum_json)
+    result_obj.frozen_at = now
+end
+local result = cjson.encode(result_obj)
+redis.call('HSET', batches_key, ikey, result)
+refresh_ttl()
+return {'ok', result}
+"""
+
+
 # 取消脚本。返回数组：
 #   {'unknown'}                          屏障不存在
 #   {'reached', quorum, frozen_at}       已达标，终态不可改写，取消被拒绝
@@ -256,6 +467,7 @@ local events_key  = KEYS[5]
 local cancel_key  = KEYS[6]
 local gmap_key    = KEYS[7]
 local gcheck_key  = KEYS[8]
+local batches_key = KEYS[9]
 local new_deadline = tonumber(ARGV[1])
 local now          = tonumber(ARGV[2])
 local buffer_ms    = tonumber(ARGV[3])
@@ -300,6 +512,7 @@ redis.call('PEXPIRE', events_key, ttl_ms)
 redis.call('PEXPIRE', cancel_key, ttl_ms)
 redis.call('PEXPIRE', gmap_key, ttl_ms)
 redis.call('PEXPIRE', gcheck_key, ttl_ms)
+redis.call('PEXPIRE', batches_key, ttl_ms)
 
 return {'extended', tostring(deadline), tostring(new_deadline), tostring(ttl_ms)}
 """
@@ -332,6 +545,7 @@ local events_key    = KEYS[5]
 local cancel_key    = KEYS[6]
 local gmap_key      = KEYS[7]
 local gcheck_key    = KEYS[8]
+local batches_key   = KEYS[9]
 local original      = ARGV[1]
 local replacement   = ARGV[2]
 local now           = tonumber(ARGV[3])
@@ -408,6 +622,7 @@ if ttl_ms then
     redis.call('PEXPIRE', cancel_key, ttl_ms)
     redis.call('PEXPIRE', gmap_key, ttl_ms)
     redis.call('PEXPIRE', gcheck_key, ttl_ms)
+    redis.call('PEXPIRE', batches_key, ttl_ms)
 end
 
 return {'replaced', original, replacement, tostring(group or ''), tostring(now)}
@@ -420,6 +635,13 @@ class BarrierNotFound(Exception):
 
 class NotAParticipant(Exception):
     """报到者不在屏障参与者名单内。"""
+
+
+class BatchNotParticipant(Exception):
+    """批量报到被拒绝：列表含名单外成员，整批不产生任何副作用。
+
+    ``args[0]`` 为不在名单内的参与者标识列表（按请求顺序）。
+    """
 
 
 class BarrierExpired(Exception):
@@ -503,6 +725,23 @@ class CancelResult:
 
 
 @dataclass(frozen=True)
+class BatchCheckinResult:
+    # checked_in（整批已接受）| reached（本批触发达标）| late（达标后才到）
+    status: str
+    # True 表示同一幂等键的重试：返回的是首次执行持久化的结果，本次无任何写操作
+    replayed: bool
+    # 本批实际新写入报到集合的成员（按请求顺序；已报到过的不在其中）
+    added: list[str]
+    quorum: list[str] | None
+    frozen_at: float | None
+
+    @property
+    def triggered(self) -> bool:
+        """本批是否是触发达标的那一次执行（重放也如实返回首次结果）。"""
+        return self.status == "reached"
+
+
+@dataclass(frozen=True)
 class ExtendResult:
     old_deadline: float  # 延期前的截止时间（Unix 秒）
     new_deadline: float  # 本次写入的截止时间（Unix 秒）
@@ -521,6 +760,7 @@ class BarrierStore:
     def __init__(self, redis: Redis) -> None:
         self.redis = redis
         self._checkin = redis.register_script(CHECKIN_SCRIPT)
+        self._checkin_batch = redis.register_script(BATCH_CHECKIN_SCRIPT)
         self._cancel = redis.register_script(CANCEL_SCRIPT)
         self._extend = redis.register_script(EXTEND_SCRIPT)
         self._substitute = redis.register_script(SUBSTITUTE_SCRIPT)
@@ -539,6 +779,7 @@ class BarrierStore:
             f"barrier:{barrier_id}:cancel",
             f"barrier:{barrier_id}:gmap",
             f"barrier:{barrier_id}:gcheck",
+            f"barrier:{barrier_id}:batches",
         )
 
     async def create(
@@ -562,6 +803,7 @@ class BarrierStore:
             _,
             gmap_key,
             gcheck_key,
+            _,
         ) = self._keys(barrier_id)
         groups = participant_groups or {}
         quotas = group_thresholds or {}
@@ -603,7 +845,7 @@ class BarrierStore:
         )
 
     async def get_meta(self, barrier_id: str) -> BarrierMeta | None:
-        meta_key, roster_key, _, _, _, _, gmap_key, _ = self._keys(barrier_id)
+        meta_key, roster_key, _, _, _, _, gmap_key, _, _ = self._keys(barrier_id)
         data = await self.redis.hgetall(meta_key)
         if not data:
             return None
@@ -654,6 +896,63 @@ class BarrierStore:
         # 冻结发生在 Lua 内部；脚本返回后立刻发布唤醒事件。
         # 即使发布丢失，等待方也有轮询兜底，不会睡死。
         if status == "reached":
+            await self.redis.publish(self.channel(barrier_id), "reached")
+
+        return result
+
+    async def checkin_batch(
+        self,
+        barrier_id: str,
+        idempotency_key: str,
+        participant_ids: list[str],
+    ) -> BatchCheckinResult:
+        """批量幂等报到：整批校验、写入与达标冻结在 Lua 中原子完成。
+
+        - 列表含名单外成员、屏障已取消或已截止：整批没有任何报到副作用，
+          幂等键不被消耗（修正名单后可用同键重试）；
+        - 首次执行的结果持久化在 ``batches`` 哈希中，同一幂等键重试原样
+          返回首次结果，不重复计数、不重复记录审计事件；
+        - 与单人报到、取消、延期、替补脚本在同一 Redis 上串行竞争：
+          达标冻结全局只发生一次，仅本次真正冻结的请求负责发布唤醒。
+        """
+        keys = self._keys(barrier_id)
+        raw = await self._checkin_batch(
+            keys=list(keys),
+            args=[
+                idempotency_key,
+                f"{time.time():.3f}",
+                len(participant_ids),
+                *participant_ids,
+            ],
+        )
+        tag = raw[0]
+
+        if tag == "unknown":
+            raise BarrierNotFound(barrier_id)
+        if tag == "not_participant":
+            raise BatchNotParticipant(json.loads(raw[1]))
+        if tag == "expired":
+            raise BarrierExpired(barrier_id)
+        if tag == "cancelled":
+            raise BarrierCancelled(barrier_id)
+
+        payload = json.loads(raw[1])
+        result = BatchCheckinResult(
+            status=payload["status"],
+            replayed=tag == "replay",
+            # cjson 把空数组编码为 {}：统一按空列表处理
+            added=list(payload.get("added") or []),
+            quorum=payload.get("quorum"),
+            frozen_at=(
+                float(payload["frozen_at"])
+                if payload.get("frozen_at") is not None
+                else None
+            ),
+        )
+
+        # 冻结发生在 Lua 内部且全局只发生一次；仅本次真正冻结的请求发布唤醒，
+        # 幂等重放不再重复广播。发布丢失也有等待方轮询兜底。
+        if tag == "ok" and result.status == "reached":
             await self.redis.publish(self.channel(barrier_id), "reached")
 
         return result
@@ -787,7 +1086,7 @@ class BarrierStore:
         return result
 
     async def get_frozen(self, barrier_id: str) -> dict[str, Any] | None:
-        _, _, _, frozen_key, _, _, _, _ = self._keys(barrier_id)
+        _, _, _, frozen_key, _, _, _, _, _ = self._keys(barrier_id)
         data = await self.redis.hgetall(frozen_key)
         if not data:
             return None
@@ -801,7 +1100,7 @@ class BarrierStore:
         return frozen
 
     async def get_cancelled(self, barrier_id: str) -> dict[str, Any] | None:
-        _, _, _, _, _, cancel_key, _, _ = self._keys(barrier_id)
+        _, _, _, _, _, cancel_key, _, _, _ = self._keys(barrier_id)
         data = await self.redis.hgetall(cancel_key)
         if not data:
             return None
@@ -811,12 +1110,12 @@ class BarrierStore:
         }
 
     async def checked_members(self, barrier_id: str) -> set[str]:
-        _, _, checked_key, _, _, _, _, _ = self._keys(barrier_id)
+        _, _, checked_key, _, _, _, _, _, _ = self._keys(barrier_id)
         return await self.redis.smembers(checked_key)
 
     async def group_check_counts(self, barrier_id: str) -> dict[str, int]:
         """读取各分组当前去重报到人数；未启用分组配额时为空字典。"""
-        _, _, _, _, _, _, _, gcheck_key = self._keys(barrier_id)
+        _, _, _, _, _, _, _, gcheck_key, _ = self._keys(barrier_id)
         raw = await self.redis.hgetall(gcheck_key)
         return {group: int(count) for group, count in raw.items()}
 
@@ -828,7 +1127,7 @@ class BarrierStore:
         事件只追加且 seq 与列表下标一一对应（下标 = seq - 1），并发报到
         只会让游标右侧变长，已读区间稳定，因此游标分页不重不漏。
         """
-        _, _, _, _, events_key, _, _, _ = self._keys(barrier_id)
+        _, _, _, _, events_key, _, _, _, _ = self._keys(barrier_id)
         raw = await self.redis.lrange(events_key, cursor, cursor + limit - 1)
         events = [json.loads(item) for item in raw]
         next_cursor = events[-1]["seq"] if events else cursor

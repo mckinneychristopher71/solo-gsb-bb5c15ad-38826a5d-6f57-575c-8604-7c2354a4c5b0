@@ -194,6 +194,70 @@ class CheckinResponse(BaseModel):
     view: BarrierView
 
 
+class BatchCheckinRequest(BaseModel):
+    idempotency_key: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description=(
+            "幂等键：同一屏障下同一键的重试原样返回首次执行结果，"
+            "不重复计数、不重复记录事件"
+        ),
+    )
+    participant_ids: list[str] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "批量报到的参与者标识列表（自动去重、去首尾空白）；"
+            "任一成员不在名单内则整批拒绝，不产生任何副作用"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "BatchCheckinRequest":
+        key = self.idempotency_key.strip()
+        if not key:
+            raise ValueError("idempotency_key 不得为空白字符串")
+        self.idempotency_key = key
+
+        # 与创建名单一致地清洗：去空白、去重并保持请求顺序
+        cleaned: list[str] = []
+        for p in self.participant_ids:
+            name = p.strip()
+            if not name:
+                raise ValueError("participant_ids 不得包含空字符串")
+            if name not in cleaned:
+                cleaned.append(name)
+        self.participant_ids = cleaned
+        return self
+
+
+class BatchCheckinResponse(BaseModel):
+    barrier_id: str
+    idempotency_key: str
+    status: str = Field(
+        description=(
+            "checked_in（整批已接受，继续等待）| reached（本批触发达标，quorum 已冻结）"
+            "| late（达标后才到，仅记录迟到，快照未变）"
+        )
+    )
+    replayed: bool = Field(
+        description=(
+            "是否为幂等键重放：true 表示返回的是该键首次执行时持久化的结果，"
+            "本次请求没有任何写副作用"
+        )
+    )
+    triggered: bool = Field(
+        description="本批是否是触发达标冻结的那一次执行；并发下全局只有一个请求为 true"
+    )
+    added: list[str] = Field(
+        description="本批实际新写入报到集合的成员（含达标后记为迟到的成员）；已报到过的不在其中"
+    )
+    quorum: list[str] | None = None
+    frozen_at: datetime | None = None
+    view: BarrierView
+
+
 class CancelRequest(BaseModel):
     reason: str = Field(
         ...,

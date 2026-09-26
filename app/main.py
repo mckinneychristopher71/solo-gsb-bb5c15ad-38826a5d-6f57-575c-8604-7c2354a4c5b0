@@ -4,6 +4,7 @@
   POST   /barriers                          创建屏障（参与者名单、达标人数、截止时间）
   GET    /barriers/{bid}                    查询当前状态（不阻塞）
   POST   /barriers/{bid}/checkin            参与者幂等报到
+  POST   /barriers/{bid}/checkin/batch      批量幂等报到（名单 + 幂等键，整批原子生效）
   POST   /barriers/{bid}/cancel             主动取消（与达标报到原子竞争，先发生者为唯一终态）
   PATCH  /barriers/{bid}/deadline           运行中延期（仅 waiting 且新时间更晚时原子生效）
   POST   /barriers/{bid}/replace            运行中替补（未报到成员原子换为名单外新标识并继承分组）
@@ -32,6 +33,7 @@ from .barrier_store import (
     BarrierReached,
     BarrierStore,
     BarrierSubstituteConflict,
+    BatchNotParticipant,
     NotAParticipant,
     ParticipantNotInRoster,
     ReplacementInRoster,
@@ -40,6 +42,8 @@ from .config import load_settings
 from .models import (
     BarrierEventsPage,
     BarrierView,
+    BatchCheckinRequest,
+    BatchCheckinResponse,
     CancelRequest,
     CancelResponse,
     CheckinEvent,
@@ -66,10 +70,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="任务收尾屏障 API",
     description=(
-        "并行任务协调收尾：创建屏障、幂等报到、阻塞等待达标、取消或截止、"
-        "运行中延期与运行中参与者替补。"
+        "并行任务协调收尾：创建屏障、幂等报到（单人 / 批量）、阻塞等待达标、"
+        "取消或截止、运行中延期与运行中参与者替补。"
     ),
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -95,6 +99,7 @@ async def root() -> dict[str, object]:
             "create": "POST /barriers",
             "get": "GET /barriers/{barrier_id}",
             "checkin": "POST /barriers/{barrier_id}/checkin",
+            "checkin_batch": "POST /barriers/{barrier_id}/checkin/batch",
             "cancel": "POST /barriers/{barrier_id}/cancel",
             "extend": "PATCH /barriers/{barrier_id}/deadline",
             "replace": "POST /barriers/{barrier_id}/replace",
@@ -197,6 +202,66 @@ async def checkin(
         barrier_id=barrier_id,
         status=result.status,
         triggered=result.triggered,
+        quorum=result.quorum,
+        frozen_at=_dt(result.frozen_at) if result.frozen_at is not None else None,
+        view=view,
+    )
+
+
+@app.post(
+    "/barriers/{barrier_id}/checkin/batch",
+    response_model=BatchCheckinResponse,
+    tags=["barriers"],
+)
+async def checkin_batch(
+    barrier_id: str, payload: BatchCheckinRequest, request: Request
+) -> BatchCheckinResponse:
+    """批量幂等报到：一次请求为整组参与者报到。
+
+    - 名单整体校验、截止/取消状态校验、整批写入、分组计数、达标冻结与
+      逐成员审计事件在同一段 Redis Lua 脚本内原子完成；
+    - 列表含未知成员、屏障已截止或已取消时**整批不产生任何报到副作用**
+      （不写报到集合、不计分组、不产生事件），幂等键也不被消耗，
+      修正名单后可用同一键重试；
+    - 同一 idempotency_key 重试**原样返回首次执行结果**（replayed=true），
+      不重复计数、不重复记录事件；
+    - 本批使屏障达标时，并发请求（含单人报到）中**只有一个**能冻结
+      quorum 并唤醒等待者，其余批量请求只会得到 checked_in / late；
+    - 达标冻结之后整批记为 late，quorum、frozen_at 与分组快照永不改写。
+    """
+    meta = await _load_meta(request, barrier_id)
+    svc = store(request)
+    try:
+        result = await svc.checkin_batch(
+            barrier_id, payload.idempotency_key, payload.participant_ids
+        )
+    except BatchNotParticipant as exc:
+        unknown = exc.args[0] if exc.args else []
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "批量报到被拒绝：以下参与者不在该屏障名单内"
+                f"（整批未生效）: {unknown}"
+            ),
+        )
+    except BarrierExpired:
+        raise HTTPException(
+            status_code=409, detail="屏障已过截止时间，整批报到被拒绝"
+        )
+    except BarrierCancelled:
+        raise HTTPException(status_code=409, detail="屏障已被取消，整批报到被拒绝")
+    except BarrierNotFound:
+        raise HTTPException(status_code=404, detail="屏障不存在或已过期回收")
+
+    view = await build_view(svc, meta)
+
+    return BatchCheckinResponse(
+        barrier_id=barrier_id,
+        idempotency_key=payload.idempotency_key,
+        status=result.status,
+        replayed=result.replayed,
+        triggered=result.triggered,
+        added=result.added,
         quorum=result.quorum,
         frozen_at=_dt(result.frozen_at) if result.frozen_at is not None else None,
         view=view,
@@ -398,12 +463,13 @@ async def list_events(
 ) -> BarrierEventsPage:
     """查询审计事件（按 seq 升序，cursor/limit 分页）。
 
-    每次名单成员报到（首次、重复、达标、迟到）都会在与状态变更同一 Redis
-    原子操作中追加一条事件；运行中参与者替补成功时也在换人脚本内追加一条
+    每次名单成员报到（首次、重复、达标、迟到；批量报到为每个成员各记一条）
+    都会在与状态变更同一 Redis 原子操作中追加一条事件；运行中参与者替补
+    成功时也在换人脚本内追加一条
     ``replaced`` 事件（``participant_id`` 为换上的新标识，
     ``original_participant_id`` 为被换下的原成员）。非名单成员、截止后报到、
-    被拒绝的替补等错误请求不产生事件。事件只增不改，游标分页在并发写入下
-    稳定不重不漏；屏障回收后事件一并消失。
+    被拒绝的替补、含未知成员的批量报到等错误请求不产生事件。事件只增不改，
+    游标分页在并发写入下稳定不重不漏；屏障回收后事件一并消失。
     """
     await _load_meta(request, barrier_id)
     events, next_cursor = await store(request).list_events(barrier_id, cursor, limit)
